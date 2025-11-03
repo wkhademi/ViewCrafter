@@ -5,13 +5,15 @@ def get_parser():
     parser = argparse.ArgumentParser()
 
     ## general
-    parser.add_argument('--image_dir', type=str, default='./test/images/fruit.png', help='Image file path')
+    parser.add_argument('--image_dir', type=str, default='/media/wkhademi/BackupDrive/Datasets/scannet_plusplus_v2/data', help='Image file path')
+    parser.add_argument('--scene_json', type=str, default='/media/wkhademi/MainDrive/GradSchool/Code/scannetplusplus_test_scenes.json', help='Scene json file path')
+    parser.add_argument('--scene_id', type=str, default="1ada7a0617", help='Scene id')
     parser.add_argument('--out_dir', type=str, default='./output', help='Output directory')
     parser.add_argument('--device', type=str, default='cuda:0', help='The device to use')
     parser.add_argument('--exp_name',  type=str, default=None, help='Experiment name, use image file name by default')
 
     ## renderer
-    parser.add_argument('--mode',  type=str,  default='single_view_txt', help="Currently we support 'single_view_txt' and 'single_view_target'")
+    parser.add_argument('--mode',  type=str,  default='sparse_view_eval', help="Currently we support 'single_view_txt' and 'single_view_target'")
     parser.add_argument('--traj_txt',  type=str, help="Required for 'single_view_txt' mode, a txt file that specify camera trajectory")
     parser.add_argument('--elevation',  type=float, default=5., help='The elevation angle of the input image in degree. Estimate a rough value based on your visual judgment' )
     parser.add_argument('--center_scale',  type=float, default=1., help='Range: (0, 2]. Scale factor for the spherical radius (r). By default, r is set to the depth value of the center pixel (H//2, W//2) of the reference image')

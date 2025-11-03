@@ -129,7 +129,6 @@ def load_images(folder_or_list, size, square_ok=False,force_1024 = False):
             if not (square_ok) and W == H:
                 halfh = 3*halfw/4
             img = img.crop((cx-halfw, cy-halfh, cx+halfw, cy+halfh))
-
         W2, H2 = img.size
         print(f' - adding {path} with resolution {W1}x{H1} --> {W2}x{H2}')
         imgs.append(dict(img=ImgNorm(img)[None], true_shape=np.int32(

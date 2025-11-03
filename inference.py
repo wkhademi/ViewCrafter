@@ -27,5 +27,8 @@ if __name__=="__main__":
     elif opts.mode == 'sparse_view_interp':
         pvd.nvs_sparse_view_interp()
 
+    elif opts.mode == 'sparse_view_eval':
+        pvd.nvs_sparse_view_eval()
+
     else:
         raise KeyError(f"Invalid Mode: {opts.mode}")

@@ -7,6 +7,7 @@ from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
 from dust3r.utils.device import to_numpy
 import trimesh
 import torch
+import json
 import numpy as np
 import torchvision
 import os
@@ -24,6 +25,9 @@ from utils.pvd_utils import *
 from omegaconf import OmegaConf
 from pytorch_lightning import seed_everything
 from utils.diffusion_utils import instantiate_from_config,load_model_checkpoint,image_guided_synthesis
+from utils.colmap_utils import (
+    read_cameras_text, undistorted_camera, camera_to_intrinsic
+)
 from pathlib import Path
 from torchvision.utils import save_image
 
@@ -35,23 +39,46 @@ class ViewCrafter:
         self.setup_diffusion()
         # initialize ref images, pcd
         if not gradio:
-            if os.path.isfile(self.opts.image_dir):
+            if self.opts.scene_json is not None and self.opts.scene_id is not None:
+                assert self.opts.scene_json.endswith('.json'), "scene_json must be a json file"
+                assert os.path.isfile(self.opts.scene_json), f"scene_json file {self.opts.scene_json} does not exist"
+                assert os.path.isdir(self.opts.image_dir), f"image_dir {self.opts.image_dir} needs to be the base data directory of dataset"
+                
+                # load input and gt data for scene
+                self.images, self.img_ori, self.camera_poses, self.gt_images, self.gt_img_ori, self.gt_camera_poses, self.K = \
+                    self.load_data_from_json(
+                        data_dir=self.opts.image_dir, 
+                        json_file=self.opts.scene_json, 
+                        scene_id=self.opts.scene_id
+                    )
+
+                # run dust3r
+                self.run_dust3r(input_images=self.images, poses=self.camera_poses, K=self.K, clean_pc=True)
+            elif os.path.isfile(self.opts.image_dir):
                 self.images, self.img_ori = self.load_initial_images(image_dir=self.opts.image_dir)
                 self.run_dust3r(input_images=self.images)
             elif os.path.isdir(self.opts.image_dir):
                 self.images, self.img_ori = self.load_initial_dir(image_dir=self.opts.image_dir)
-                self.run_dust3r(input_images=self.images, clean_pc = True)    
+                self.run_dust3r(input_images=self.images, clean_pc=True)    
             else:
                 print(f"{self.opts.image_dir} doesn't exist")           
         
-    def run_dust3r(self, input_images,clean_pc = False):
+    def run_dust3r(self, input_images, poses=None, K=None, clean_pc=False):
         pairs = make_pairs(input_images, scene_graph='complete', prefilter=None, symmetrize=True)
         output = inference(pairs, self.dust3r, self.device, batch_size=self.opts.batch_size)
 
         mode = GlobalAlignerMode.PointCloudOptimizer #if len(self.images) > 2 else GlobalAlignerMode.PairViewer
         scene = global_aligner(output, device=self.device, mode=mode)
         if mode == GlobalAlignerMode.PointCloudOptimizer:
-            loss = scene.compute_global_alignment(init='mst', niter=self.opts.niter, schedule=self.opts.schedule, lr=self.opts.lr)
+            if poses is not None and K is not None:
+                scene.preset_pose(poses)
+                focals = [K[0, 0]] * len(poses)
+                scene.preset_focal(focals)
+                # principal_points = [[K[0, 2], K[1, 2]]] * len(poses)
+                # scene.preset_principal_point(principal_points)
+                loss = scene.compute_global_alignment(init='known_poses', niter=self.opts.niter, schedule=self.opts.schedule, lr=self.opts.lr)
+            else:
+                loss = scene.compute_global_alignment(init='mst', niter=self.opts.niter, schedule=self.opts.schedule, lr=self.opts.lr)
 
         if clean_pc:
             self.scene = scene.clean_pointcloud()
@@ -90,15 +117,17 @@ class ViewCrafter:
         return render_results, viewmask
 
     
-    def run_diffusion(self, renderings):
+    def run_diffusion(self, renderings, conditioning_frame=None):
 
         prompts = [self.opts.prompt]
         videos = (renderings * 2. - 1.).permute(3,0,1,2).unsqueeze(0).to(self.device)
+        if conditioning_frame is not None:
+            conditioning_frame = (conditioning_frame * 2. - 1.).permute(2,0,1).unsqueeze(0).to(self.device)
         condition_index = [0]
         with torch.no_grad(), torch.cuda.amp.autocast():
             # [1,1,c,t,h,w]
             batch_samples = image_guided_synthesis(self.diffusion, prompts, videos, self.noise_shape, self.opts.n_samples, self.opts.ddim_steps, self.opts.ddim_eta, \
-                               self.opts.unconditional_guidance_scale, self.opts.cfg_img, self.opts.frame_stride, self.opts.text_input, self.opts.multiple_cond_cfg, self.opts.timestep_spacing, self.opts.guidance_rescale, condition_index)
+                               self.opts.unconditional_guidance_scale, self.opts.cfg_img, self.opts.frame_stride, self.opts.text_input, self.opts.multiple_cond_cfg, self.opts.timestep_spacing, self.opts.guidance_rescale, condition_index, conditioning_frame=conditioning_frame)
 
             # save_results_seperate(batch_samples[0], self.opts.save_dir, fps=8)
             # torch.Size([1, 3, 25, 576, 1024]) [-1,1]
@@ -258,7 +287,7 @@ class ViewCrafter:
 
         imgs = np.array(self.scene.imgs)
 
-        camera_traj,num_views = generate_traj_interp(c2ws, H, W, focals, principal_points, self.opts.video_length, self.device)
+        camera_traj, num_views = generate_traj_interp(c2ws, H, W, focals, principal_points, self.opts.video_length, self.device)
         render_results, viewmask = self.run_render(pcd, imgs,masks, H, W, camera_traj,num_views)
         render_results = F.interpolate(render_results.permute(0,3,1,2), size=(576, 1024), mode='bilinear', align_corners=False).permute(0,2,3,1)
         
@@ -305,6 +334,61 @@ class ViewCrafter:
         diffusion_results = self.run_diffusion(render_results)
 
         save_video((diffusion_results + 1.0) / 2.0, os.path.join(self.opts.save_dir, f'diffusion_ref0.mp4'))
+        # torch.Size([25, 576, 1024, 3])
+        return diffusion_results
+
+    def nvs_sparse_view_eval(self):
+
+        c2ws = self.scene.get_im_poses().detach()
+        principal_points = self.scene.get_principal_points().detach()
+        focals = self.scene.get_focals().detach()
+        
+        # set camera poses to novel views
+        gt_c2ws = torch.stack([torch.tensor(pose) for pose in self.gt_camera_poses]).to(self.device)
+        principal_points = principal_points[0:1].expand(len(self.gt_camera_poses), -1)
+        focals = focals[0:1].expand(len(self.gt_camera_poses), -1)
+
+        shape = self.images[0]['true_shape']
+        H, W = int(shape[0][0]), int(shape[0][1])
+        pcd = [i.detach() for i in self.scene.get_pts3d(clip_thred=self.opts.dpt_trd)] # a list of points of size whc
+        depth = [i.detach() for i in self.scene.get_depthmaps()]
+
+        if len(self.images) == 2:
+            masks = None
+            mask_pc = False
+        else:
+            ## masks for cleaner point cloud
+            self.scene.min_conf_thr = float(self.scene.conf_trf(torch.tensor(self.opts.min_conf_thr)))
+            masks = self.scene.get_masks()
+            depth = self.scene.get_depthmaps()
+            bgs_mask = [dpt > self.opts.bg_trd*(torch.max(dpt[40:-40,:])+torch.min(dpt[40:-40,:])) for dpt in depth]
+            masks_new = [m+mb for m, mb in zip(masks,bgs_mask)] 
+            masks = to_numpy(masks_new)
+            mask_pc = True
+
+        imgs = np.array(self.scene.imgs)
+
+        camera_traj, num_views = generate_traj_interp2(c2ws, gt_c2ws, H, W, focals, principal_points, self.opts.video_length, self.device)
+        render_results, viewmask = self.run_render(pcd, imgs, masks, H, W, camera_traj, num_views)
+        render_results = F.interpolate(render_results.permute(0,3,1,2), size=(576, 1024), mode='bilinear', align_corners=False).permute(0,2,3,1)
+        
+        for i in range(len(self.img_ori)):
+            render_results[i*(self.opts.video_length - 1)] = self.img_ori[i]
+        save_video(render_results, os.path.join(self.opts.save_dir, f'render.mp4'))
+        save_pointcloud_with_normals(imgs, pcd, msk=masks, save_path=os.path.join(self.opts.save_dir, f'pcd.ply') , mask_pc=mask_pc, reduce_pc=False)
+
+        diffusion_results = []
+        print(f'Generating {len(self.img_ori)-1} clips\n')
+        for i in range(len(self.img_ori)-1 ):
+            print(f'Generating clip {i} ...\n')
+            diffusion_results.append(
+                self.run_diffusion(
+                    render_results[i*(self.opts.video_length - 1):self.opts.video_length+i*(self.opts.video_length - 1)], 
+                )
+            )
+        print(f'Finish!\n')
+        diffusion_results = torch.cat(diffusion_results)
+        save_video((diffusion_results + 1.0) / 2.0, os.path.join(self.opts.save_dir, f'diffusion.mp4'))
         # torch.Size([25, 576, 1024, 3])
         return diffusion_results
 
@@ -432,6 +516,61 @@ class ViewCrafter:
             img_gts.append((images[i]['img_ori'].squeeze(0).permute(1,2,0)+1.)/2.) 
 
         return images, img_gts
+
+    def load_data_from_json(self, data_dir, json_file, scene_id):
+        # parse json file for image file names
+        with open(json_file, 'r') as file:
+            data = json.load(file)
+        input_image_files = [os.path.join(data_dir, scene_id, "dslr", "render_rgb", i) for i in data[scene_id]['input_view_ids']]
+        # input_image_files = sorted(input_image_files, key=lambda x: x.split('/')[-1].split('.')[0])
+        gt_novel_view_image_files = [os.path.join(data_dir, scene_id, "dslr", "render_rgb", i) for i in data[scene_id]['render_view_ids']]
+        # gt_novel_view_image_files = sorted(gt_novel_view_image_files, key=lambda x: x.split('/')[-1].split('.')[0])
+
+        # load input images
+        input_images = load_images(input_image_files, size=512, force_1024=True)
+        input_images_ori = []
+        for i in range(len(input_image_files)):
+            input_images_ori.append((input_images[i]['img_ori'].squeeze(0).permute(1,2,0)+1.)/2.)
+
+        # load gt images
+        gt_novel_view_images = load_images(gt_novel_view_image_files, size=512, force_1024=True)
+        gt_novel_view_images_ori = []
+        for i in range(len(gt_novel_view_image_files)):
+            gt_novel_view_images_ori.append((gt_novel_view_images[i]['img_ori'].squeeze(0).permute(1,2,0)+1.)/2.)
+
+        # load camera intrinsics
+        intrinsics_file = os.path.join(data_dir, scene_id, "dslr", "colmap", "cameras.txt")
+        colmap_camera = list(read_cameras_text(intrinsics_file).values())[0]
+        pinhole_camera = undistorted_camera(colmap_camera)
+        K = camera_to_intrinsic(pinhole_camera)
+
+        # update intrinsics based on resizing and cropping
+        ratio1 = 1752.0 / 1024.0
+        scale1 = 1.0 / ratio1
+        K[:2, :] *= scale1
+        K[1, 2] = np.round(K[1, 2])
+        crop = 53.0
+        K[1, 2] -= crop
+        ratio2 = 1024.0 / 512.0
+        scale2 = 1.0 / ratio2
+        K[:2, :] *= scale2
+        K[1, 2] = np.round(K[1, 2])
+
+        # load camera poses
+        input_camera_poses = []
+        for i in range(len(input_image_files)):
+            image_name = input_image_files[i].split('/')[-1].split('.')[0]
+            pose_file = os.path.join(data_dir, scene_id, "dslr", "pose", f"{image_name}.txt")
+            cam_T = np.loadtxt(pose_file)
+            input_camera_poses.append(cam_T)
+        gt_novel_view_camera_poses = []
+        for i in range(len(gt_novel_view_image_files)):
+            image_name = gt_novel_view_image_files[i].split('/')[-1].split('.')[0]
+            pose_file = os.path.join(data_dir, scene_id, "dslr", "pose", f"{image_name}.txt")
+            cam_T = np.loadtxt(pose_file)
+            gt_novel_view_camera_poses.append(cam_T)
+
+        return input_images, input_images_ori, input_camera_poses, gt_novel_view_images, gt_novel_view_images_ori, gt_novel_view_camera_poses, K
 
     def run_gradio(self,i2v_input_image, i2v_elevation, i2v_center_scale, i2v_d_phi, i2v_d_theta, i2v_d_r, i2v_steps, i2v_seed):
         self.opts.elevation = float(i2v_elevation)

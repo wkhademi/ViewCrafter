@@ -115,7 +115,9 @@ def get_latent_z(model, videos):
     return z
 
 def image_guided_synthesis(model, prompts, videos, noise_shape, n_samples=1, ddim_steps=50, ddim_eta=1., \
-                        unconditional_guidance_scale=1.0, cfg_img=None, fs=None, text_input=False, multiple_cond_cfg=False, timestep_spacing='uniform', guidance_rescale=0.0, condition_index=None, **kwargs):
+                        unconditional_guidance_scale=1.0, cfg_img=None, fs=None, text_input=False, 
+                        multiple_cond_cfg=False, timestep_spacing='uniform', guidance_rescale=0.0, condition_index=None, 
+                        conditioning_frame=None, **kwargs):
     ddim_sampler = DDIMSampler(model) if not multiple_cond_cfg else DDIMSampler_multicond(model)
     batch_size = noise_shape[0]
     fs = torch.tensor([fs] * batch_size, dtype=torch.long, device=model.device)
