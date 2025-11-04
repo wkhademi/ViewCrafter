@@ -9,6 +9,7 @@ import trimesh
 import torch
 import json
 import numpy as np
+import matplotlib.pyplot as plt
 import torchvision
 import os
 import copy
@@ -30,6 +31,8 @@ from utils.colmap_utils import (
 )
 from pathlib import Path
 from torchvision.utils import save_image
+from torchmetrics.image import StructuralSimilarityIndexMeasure
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 class ViewCrafter:
     def __init__(self, opts, gradio = False):
@@ -37,6 +40,8 @@ class ViewCrafter:
         self.device = opts.device
         self.setup_dust3r()
         self.setup_diffusion()
+        self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0) #.cuda()
+        self.lpips = LearnedPerceptualImagePatchSimilarity(net_type='vgg', normalize=True) #.cuda()
         # initialize ref images, pcd
         if not gradio:
             if self.opts.scene_json is not None and self.opts.scene_id is not None:
@@ -111,9 +116,41 @@ class ViewCrafter:
         return images, view_masks
     
     def run_render(self, pcd, imgs,masks, H, W, camera_traj,num_views,nbv=False):
-        render_setup = setup_renderer(camera_traj, image_size=(H,W))
-        renderer = render_setup['renderer']
-        render_results, viewmask = self.render_pcd(pcd, imgs, masks, num_views,renderer,self.device,nbv=False)
+        batch_size = 50  # You may want to make this configurable
+        render_results_list = []
+        viewmask_list = []
+        from pytorch3d.renderer.cameras import PerspectiveCameras
+
+        total_views = num_views if isinstance(num_views, int) else camera_traj.R.shape[0]
+        for i in range(0, total_views, batch_size):
+            batch_slice = slice(i, min(i + batch_size, total_views))
+
+            # Create a sub-batch of camera_traj
+            # Camera parameters: R, T, focal_length, principal_point, etc., must be batched accordingly.
+            cam_kwargs = dict(
+                R=camera_traj.R[batch_slice].to(self.device),
+                T=camera_traj.T[batch_slice].to(self.device),
+                focal_length=camera_traj.focal_length[batch_slice].to(self.device),
+                principal_point=camera_traj.principal_point[batch_slice].to(self.device),
+                image_size=(camera_traj.image_size[0],) * (batch_slice.stop - batch_slice.start) if isinstance(camera_traj.image_size, tuple) else camera_traj.image_size[batch_slice],  # Ensure tuple batch
+                device=self.device,
+                in_ndc=False,
+            )
+            camera_traj_batch = PerspectiveCameras(**cam_kwargs)
+            render_setup = setup_renderer(camera_traj_batch, image_size=(H, W))
+            renderer = render_setup['renderer']
+            batch_results, batch_viewmask = self.render_pcd(
+                pcd, imgs, masks, batch_slice.stop - batch_slice.start, renderer, self.device, nbv=nbv
+            )
+            render_results_list.append(batch_results)
+            viewmask_list.append(batch_viewmask)
+
+        # Concatenate results along batch dimension if not None
+        render_results = torch.cat(render_results_list, dim=0) if render_results_list[0] is not None else None
+        if viewmask_list[0] is not None and all(vm is not None for vm in viewmask_list):
+            viewmask = torch.cat(viewmask_list, dim=0)
+        else:
+            viewmask = None
         return render_results, viewmask
 
     
@@ -339,14 +376,24 @@ class ViewCrafter:
 
     def nvs_sparse_view_eval(self):
 
+        # Ensure rendered_image and gt_image are on cpu and in numpy format, in [0,1] for display
+        def to_numpy_img(img_tensor):
+            if isinstance(img_tensor, np.ndarray):
+                return img_tensor
+            img = img_tensor.detach().cpu().numpy()
+            # If shape is (C,H,W), transpose to (H,W,C)
+            if img.shape[0] == 3 and img.ndim == 3:
+                img = np.transpose(img, (1,2,0))
+            return np.clip(img, 0, 1)
+
         c2ws = self.scene.get_im_poses().detach()
         principal_points = self.scene.get_principal_points().detach()
         focals = self.scene.get_focals().detach()
         
         # set camera poses to novel views
         gt_c2ws = torch.stack([torch.tensor(pose) for pose in self.gt_camera_poses]).to(self.device)
-        principal_points = principal_points[0:1].expand(len(self.gt_camera_poses), -1)
-        focals = focals[0:1].expand(len(self.gt_camera_poses), -1)
+        principal_points = principal_points[0:1].expand(len(self.gt_camera_poses) + 1, -1)
+        focals = focals[0:1].expand(len(self.gt_camera_poses) + 1, -1)
 
         shape = self.images[0]['true_shape']
         H, W = int(shape[0][0]), int(shape[0][1])
@@ -368,14 +415,18 @@ class ViewCrafter:
 
         imgs = np.array(self.scene.imgs)
 
-        camera_traj, num_views = generate_traj_interp2(c2ws, gt_c2ws, H, W, focals, principal_points, self.opts.video_length, self.device)
+        camera_traj, num_views, interp_c2ws = generate_traj_interp2(c2ws, gt_c2ws, H, W, focals, principal_points, self.opts.video_length, self.device)
         render_results, viewmask = self.run_render(pcd, imgs, masks, H, W, camera_traj, num_views)
         render_results = F.interpolate(render_results.permute(0,3,1,2), size=(576, 1024), mode='bilinear', align_corners=False).permute(0,2,3,1)
-        
+
         for i in range(len(self.img_ori)):
             render_results[i*(self.opts.video_length - 1)] = self.img_ori[i]
         save_video(render_results, os.path.join(self.opts.save_dir, f'render.mp4'))
         save_pointcloud_with_normals(imgs, pcd, msk=masks, save_path=os.path.join(self.opts.save_dir, f'pcd.ply') , mask_pc=mask_pc, reduce_pc=False)
+
+        del self.dust3r
+        del self.scene
+        torch.cuda.empty_cache()
 
         diffusion_results = []
         print(f'Generating {len(self.img_ori)-1} clips\n')
@@ -390,7 +441,60 @@ class ViewCrafter:
         diffusion_results = torch.cat(diffusion_results)
         save_video((diffusion_results + 1.0) / 2.0, os.path.join(self.opts.save_dir, f'diffusion.mp4'))
         # torch.Size([25, 576, 1024, 3])
-        return diffusion_results
+
+        diffusion_results = (diffusion_results + 1.0) / 2.0
+        diffusion_results = diffusion_results.to(torch.float32)
+
+        test_poses = [12, 37, 62, 87]
+        rendered_images = []
+        for i in test_poses:
+            rendered_image = diffusion_results[i]
+            rendered_images.append(rendered_image)
+        rendered_images = torch.stack(rendered_images, dim=0).float().cpu()
+        gt_images = torch.stack(self.gt_img_ori, dim=0).float().cpu()
+
+        # downsample
+        rendered_images = F.interpolate(rendered_images.permute(0,3,1,2), size=(360, 480), mode='bilinear', align_corners=False)
+        gt_images = F.interpolate(gt_images.permute(0,3,1,2), size=(360, 480), mode='bilinear', align_corners=False)
+
+        for i in range(len(rendered_images)):
+            rendered_image = rendered_images[i].cpu() #.permute(1,2,0)
+            gt_image = gt_images[i].cpu() #.permute(1,2,0)
+            
+            # rendered_to_show = to_numpy_img(rendered_image)
+            # gt_to_show = to_numpy_img(gt_image)
+
+            # Save rendered and ground truth images to the save directory instead of visualizing
+            rendered_path = os.path.join(self.opts.save_dir, f"rendered_{i}.png")
+            gt_path = os.path.join(self.opts.save_dir, f"gt_{i}.png")
+            torchvision.utils.save_image(rendered_image, rendered_path)
+            torchvision.utils.save_image(gt_image, gt_path)
+
+        # Compute PSNR
+        mse = F.mse_loss(rendered_images, gt_images, reduction='none')
+        mse_per_image = mse.reshape(mse.shape[0], -1).mean(dim=1)
+        psnr_per_image = -10 * torch.log10(mse_per_image + 1e-8)
+        psnr = psnr_per_image.mean().item()
+
+        # SSIM
+        ssim_value = self.ssim(rendered_images, gt_images)
+        ssim_value = ssim_value.item()
+
+        # LPIPS
+        lpips_value = self.lpips(rendered_images, gt_images)
+        lpips_value = lpips_value.item()
+
+        print(f"Evaluation Metrics:\n"
+                  f"PSNR: {psnr:.3f} dB\n"
+                  f"SSIM: {ssim_value:.4f}\n"
+                  f"LPIPS: {lpips_value:.4f}")
+
+        eval_metrics = {}
+        eval_metrics['psnr'] = psnr
+        eval_metrics['ssim'] = ssim_value
+        eval_metrics['lpips'] = lpips_value
+
+        return diffusion_results, eval_metrics
 
     def nvs_single_view_ref_iterative(self):
 

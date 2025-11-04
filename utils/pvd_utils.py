@@ -236,7 +236,7 @@ def interp_traj2(c2ws: torch.Tensor, gt_c2ws: torch.Tensor, n_inserts: int = 25,
     n_poses = c2ws.shape[0] 
     interpolated_poses = []
 
-    for i in range(n_poses-1):
+    for i in range(n_poses - 1):
         start_pose = c2ws[i]
         middle_pose = gt_c2ws[i]
         end_pose = c2ws[(i + 1) % n_poses]
@@ -296,7 +296,7 @@ def generate_traj_interp2(c2ws,gt_c2ws,H,W,fs,c,ns,device):
     c = interpolate_sequence(c,ns-2,device=device)
     cameras = PerspectiveCameras(focal_length=fs, principal_point=c, in_ndc=False, image_size=image_size, R=R_new, T=T_new, device=device)
     
-    return cameras, num_views
+    return cameras, num_views, c2ws
 
 def generate_traj_specified(c2ws_anchor,H,W,fs,c,theta, phi,d_r,d_x,d_y,frame,device):
     # Initialize a camera.
