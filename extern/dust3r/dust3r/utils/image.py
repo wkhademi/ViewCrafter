@@ -5,6 +5,7 @@
 # utilitary functions about images (loading/converting...)
 # --------------------------------------------------------
 import os
+import h5py
 import torch
 import numpy as np
 import PIL.Image
@@ -99,7 +100,7 @@ def load_images(folder_or_list, size, square_ok=False,force_1024 = False):
     else:
         raise ValueError(f'bad {folder_or_list=} ({type(folder_or_list)})')
 
-    supported_images_extensions = ['.jpg', '.jpeg', '.png']
+    supported_images_extensions = ['.jpg', '.jpeg', '.png', '.hdf5']
     if heif_support_enabled:
         supported_images_extensions += ['.heic', '.heif']
     supported_images_extensions = tuple(supported_images_extensions)
@@ -108,9 +109,17 @@ def load_images(folder_or_list, size, square_ok=False,force_1024 = False):
     for path in folder_content:
         if not path.lower().endswith(supported_images_extensions):
             continue
-        img = exif_transpose(PIL.Image.open(os.path.join(root, path))).convert('RGB')
+        if path.endswith('.hdf5'):
+            with h5py.File(os.path.join(root, path)) as f:
+                img = np.array(f["colors"])[:,::-1].astype(np.uint8)
+                img = Image.fromarray(img)
+        else:
+            img = exif_transpose(PIL.Image.open(os.path.join(root, path))).convert('RGB')
         if force_1024:
             img = center_crop_pil_image(img)
+        W1, H1 = img.size
+        if W1 != 480 or H1 != 360:
+            img = img.resize((480, 360), PIL.Image.BICUBIC)
         img_ori = img
         W1, H1 = img.size
         if size == 224:

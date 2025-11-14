@@ -1,5 +1,6 @@
 from viewcrafter import ViewCrafter
 import os
+import json
 from configs.infer_config import get_parser
 from utils.pvd_utils import *
 from datetime import datetime
@@ -11,11 +12,14 @@ if __name__=="__main__":
     if opts.exp_name == None:
         prefix = datetime.now().strftime("%Y%m%d_%H%M")
         opts.exp_name = f'{prefix}_{os.path.splitext(os.path.basename(opts.image_dir))[0]}'
+
+    with open(opts.scene_json, 'r') as file:
+        data = json.load(file)
     
     avg_psnr = []
     avg_ssim = []
     avg_lpips = []
-    for scene_id in ["1ada7a0617", "3f15a9266d", "5f99900f09", "45b0dac5e3", "6115eddb86"]:
+    for scene_id in list(data.keys()):
         opts.save_dir = os.path.join(opts.out_dir, opts.exp_name, scene_id)
         os.makedirs(opts.save_dir,exist_ok=True)
         opts.scene_id = scene_id

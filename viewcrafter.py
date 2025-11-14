@@ -8,6 +8,7 @@ from dust3r.utils.device import to_numpy
 import trimesh
 import torch
 import json
+import h5py
 import numpy as np
 import matplotlib.pyplot as plt
 import torchvision
@@ -417,10 +418,10 @@ class ViewCrafter:
 
         camera_traj, num_views, interp_c2ws = generate_traj_interp2(c2ws, gt_c2ws, H, W, focals, principal_points, self.opts.video_length, self.device)
         render_results, viewmask = self.run_render(pcd, imgs, masks, H, W, camera_traj, num_views)
+        for i in range(len(self.images)):
+            render_results[i*(self.opts.video_length - 1)] = (self.images[i]['img'].squeeze(0).permute(1,2,0)+1.)/2.
         render_results = F.interpolate(render_results.permute(0,3,1,2), size=(576, 1024), mode='bilinear', align_corners=False).permute(0,2,3,1)
-
-        for i in range(len(self.img_ori)):
-            render_results[i*(self.opts.video_length - 1)] = self.img_ori[i]
+        
         save_video(render_results, os.path.join(self.opts.save_dir, f'render.mp4'))
         save_pointcloud_with_normals(imgs, pcd, msk=masks, save_path=os.path.join(self.opts.save_dir, f'pcd.ply') , mask_pc=mask_pc, reduce_pc=False)
 
@@ -445,7 +446,10 @@ class ViewCrafter:
         diffusion_results = (diffusion_results + 1.0) / 2.0
         diffusion_results = diffusion_results.to(torch.float32)
 
-        test_poses = [12, 37, 62, 87]
+        if 87 < len(diffusion_results):
+            test_poses = [12, 37, 62, 87]
+        else:
+            test_poses = [12, 37, 62]
         rendered_images = []
         for i in test_poses:
             rendered_image = diffusion_results[i]
@@ -622,59 +626,145 @@ class ViewCrafter:
         return images, img_gts
 
     def load_data_from_json(self, data_dir, json_file, scene_id):
-        # parse json file for image file names
-        with open(json_file, 'r') as file:
-            data = json.load(file)
-        input_image_files = [os.path.join(data_dir, scene_id, "dslr", "render_rgb", i) for i in data[scene_id]['input_view_ids']]
-        # input_image_files = sorted(input_image_files, key=lambda x: x.split('/')[-1].split('.')[0])
-        gt_novel_view_image_files = [os.path.join(data_dir, scene_id, "dslr", "render_rgb", i) for i in data[scene_id]['render_view_ids']]
-        # gt_novel_view_image_files = sorted(gt_novel_view_image_files, key=lambda x: x.split('/')[-1].split('.')[0])
+        def __blender2opencv_cam(cam_T):
+            # blender camera to opengl camera
+            y_z_swap = np.array([[1, 0, 0, 0], [0, 0, 1, 0], [0, 1, 0, 0], [0, 0, 0, 1]])
+            cam_T = y_z_swap.dot(cam_T)
+            cam_T[:3, 0] *= -1
 
-        # load input images
-        input_images = load_images(input_image_files, size=512, force_1024=True)
-        input_images_ori = []
-        for i in range(len(input_image_files)):
-            input_images_ori.append((input_images[i]['img_ori'].squeeze(0).permute(1,2,0)+1.)/2.)
+            # opengl camera to opencv camera
+            cam_T[:3, 1] *= -1
+            cam_T[:3, 2] *= -1
 
-        # load gt images
-        gt_novel_view_images = load_images(gt_novel_view_image_files, size=512, force_1024=True)
-        gt_novel_view_images_ori = []
-        for i in range(len(gt_novel_view_image_files)):
-            gt_novel_view_images_ori.append((gt_novel_view_images[i]['img_ori'].squeeze(0).permute(1,2,0)+1.)/2.)
+            # # Rotate the pose -90 degrees about the x-axis (in radians)
+            # angle = -np.pi / 2
+            # Rx = np.array([
+            #     [1, 0, 0, 0],
+            #     [0, np.cos(angle), -np.sin(angle), 0],
+            #     [0, np.sin(angle),  np.cos(angle), 0],
+            #     [0, 0, 0, 1]
+            # ])
+            # cam_T = Rx @ cam_T
+            # # Invert the z-axis by multiplying the third row of the rotation and translation by -1
+            # cam_T[2, :] *= -1
 
-        # load camera intrinsics
-        intrinsics_file = os.path.join(data_dir, scene_id, "dslr", "colmap", "cameras.txt")
-        colmap_camera = list(read_cameras_text(intrinsics_file).values())[0]
-        pinhole_camera = undistorted_camera(colmap_camera)
-        K = camera_to_intrinsic(pinhole_camera)
+            return cam_T
+        
+        if "scannet" in data_dir:
+            # parse json file for image file names
+            with open(json_file, 'r') as file:
+                data = json.load(file)
+            input_image_files = [os.path.join(data_dir, scene_id, "dslr", "render_rgb", i) for i in data[scene_id]['input_view_ids']]
+            # input_image_files = sorted(input_image_files, key=lambda x: x.split('/')[-1].split('.')[0])
+            gt_novel_view_image_files = [os.path.join(data_dir, scene_id, "dslr", "render_rgb", i) for i in data[scene_id]['render_view_ids']]
+            # gt_novel_view_image_files = sorted(gt_novel_view_image_files, key=lambda x: x.split('/')[-1].split('.')[0])
 
-        # update intrinsics based on resizing and cropping
-        ratio1 = 1752.0 / 1024.0
-        scale1 = 1.0 / ratio1
-        K[:2, :] *= scale1
-        K[1, 2] = np.round(K[1, 2])
-        crop = 53.0
-        K[1, 2] -= crop
-        ratio2 = 1024.0 / 512.0
-        scale2 = 1.0 / ratio2
-        K[:2, :] *= scale2
-        K[1, 2] = np.round(K[1, 2])
+            # load input images
+            input_images = load_images(input_image_files, size=512, force_1024=False)
+            input_images_ori = []
+            for i in range(len(input_image_files)):
+                input_images_ori.append((input_images[i]['img_ori'].squeeze(0).permute(1,2,0)+1.)/2.)
 
-        # load camera poses
-        input_camera_poses = []
-        for i in range(len(input_image_files)):
-            image_name = input_image_files[i].split('/')[-1].split('.')[0]
-            pose_file = os.path.join(data_dir, scene_id, "dslr", "pose", f"{image_name}.txt")
-            cam_T = np.loadtxt(pose_file)
-            input_camera_poses.append(cam_T)
-        gt_novel_view_camera_poses = []
-        for i in range(len(gt_novel_view_image_files)):
-            image_name = gt_novel_view_image_files[i].split('/')[-1].split('.')[0]
-            pose_file = os.path.join(data_dir, scene_id, "dslr", "pose", f"{image_name}.txt")
-            cam_T = np.loadtxt(pose_file)
-            gt_novel_view_camera_poses.append(cam_T)
+            # load gt images
+            gt_novel_view_images = load_images(gt_novel_view_image_files, size=512, force_1024=False)
+            gt_novel_view_images_ori = []
+            for i in range(len(gt_novel_view_image_files)):
+                gt_novel_view_images_ori.append((gt_novel_view_images[i]['img_ori'].squeeze(0).permute(1,2,0)+1.)/2.)
 
-        return input_images, input_images_ori, input_camera_poses, gt_novel_view_images, gt_novel_view_images_ori, gt_novel_view_camera_poses, K
+            # load camera intrinsics
+            intrinsics_file = os.path.join(data_dir, scene_id, "dslr", "colmap", "cameras.txt")
+            colmap_camera = list(read_cameras_text(intrinsics_file).values())[0]
+            pinhole_camera = undistorted_camera(colmap_camera)
+            K = camera_to_intrinsic(pinhole_camera)
+
+            # update intrinsics based on resizing and cropping
+            # ratio1 = 1752.0 / 1024.0
+            # scale1 = 1.0 / ratio1
+            # K[:2, :] *= scale1
+            # K[1, 2] = np.round(K[1, 2])
+            # crop = 53.0
+            # K[1, 2] -= crop
+            # ratio2 = 1024.0 / 512.0
+            height, width = pinhole_camera.height, pinhole_camera.width
+            s_x = 480.0 / float(width)
+            s_y = 360.0 / float(height)
+            K[0, 0] *= s_x
+            K[1, 1] *= s_y
+            K[0, 2] = 480.0 / 2.
+            K[1, 2] = 360.0 / 2.
+            ratio2 = 480.0 / 512.0
+            scale2 = 1.0 / ratio2
+            K[:2, :] *= scale2
+            K[1, 2] = np.round(K[1, 2])
+
+            # load camera poses
+            input_camera_poses = []
+            for i in range(len(input_image_files)):
+                image_name = input_image_files[i].split('/')[-1].split('.')[0]
+                pose_file = os.path.join(data_dir, scene_id, "dslr", "pose", f"{image_name}.txt")
+                cam_T = np.loadtxt(pose_file)
+                input_camera_poses.append(cam_T)
+            gt_novel_view_camera_poses = []
+            for i in range(len(gt_novel_view_image_files)):
+                image_name = gt_novel_view_image_files[i].split('/')[-1].split('.')[0]
+                pose_file = os.path.join(data_dir, scene_id, "dslr", "pose", f"{image_name}.txt")
+                cam_T = np.loadtxt(pose_file)
+                gt_novel_view_camera_poses.append(cam_T)
+
+            return input_images, input_images_ori, input_camera_poses, gt_novel_view_images, \
+                gt_novel_view_images_ori, gt_novel_view_camera_poses, K
+        elif "3D-FRONT" in data_dir:
+            # parse json file for image file names
+            with open(json_file, 'r') as file:
+                data = json.load(file)
+            scene_name = scene_id.split(' ')[0]
+            room_name = scene_id.split(' ')[1]
+            input_image_files = [os.path.join(data_dir, scene_name, room_name, i) for i in data[scene_id]['input_view_ids']]
+            gt_novel_view_image_files = [os.path.join(data_dir, scene_name, room_name, i) for i in data[scene_id]['render_view_ids']]
+
+             # load input images
+            input_images = load_images(input_image_files, size=512, force_1024=False)
+            input_images_ori = []
+            for i in range(len(input_image_files)):
+                input_images_ori.append((input_images[i]['img_ori'].squeeze(0).permute(1,2,0)+1.)/2.)
+
+            # load gt images
+            gt_novel_view_images = load_images(gt_novel_view_image_files, size=512, force_1024=False)
+            gt_novel_view_images_ori = []
+            for i in range(len(gt_novel_view_image_files)):
+                gt_novel_view_images_ori.append((gt_novel_view_images[i]['img_ori'].squeeze(0).permute(1,2,0)+1.)/2.)
+
+            K = np.load(os.path.join(data_dir, "cam_K.npy"))
+
+            # update intrinsics based on resizing and cropping
+            # ratio1 = 480.0 / 1024.0
+            # scale1 = 1.0 / ratio1
+            # K[:2, :] *= scale1
+            # K[1, 2] = np.round(K[1, 2])
+            # crop = 96.0
+            # K[1, 2] -= crop
+            # ratio2 = 1024.0 / 512.0
+            ratio2 = 480.0 / 512.0
+            scale2 = 1.0 / ratio2
+            K[:2, :] *= scale2
+            K[1, 2] = np.round(K[1, 2])
+
+            # load camera poses
+            input_camera_poses = []
+            for i in range(len(input_image_files)):
+                with h5py.File(input_image_files[i]) as f:
+                    cam_T = __blender2opencv_cam(np.array(f["cam_Ts"]))
+                input_camera_poses.append(cam_T)
+            gt_novel_view_camera_poses = []
+            for i in range(len(gt_novel_view_image_files)):
+                with h5py.File(gt_novel_view_image_files[i]) as f:
+                    cam_T = __blender2opencv_cam(np.array(f["cam_Ts"]))
+                gt_novel_view_camera_poses.append(cam_T)
+
+            return input_images, input_images_ori, input_camera_poses, gt_novel_view_images, \
+                gt_novel_view_images_ori, gt_novel_view_camera_poses, K
+        else:
+            raise ValueError(f"Invalid dataset: {data_dir}")
 
     def run_gradio(self,i2v_input_image, i2v_elevation, i2v_center_scale, i2v_d_phi, i2v_d_theta, i2v_d_r, i2v_steps, i2v_seed):
         self.opts.elevation = float(i2v_elevation)

@@ -1,0 +1,14 @@
+python inference.py \
+--image_dir /media/wkhademi/BackupDrive/Datasets/3D-FRONT-renderings \
+--scene_json /media/wkhademi/MainDrive/GradSchool/Code/threedfront_test_scenes.json \
+--out_dir ./output \
+--bg_trd 0.2 \
+--seed 123 \
+--ckpt_path ./checkpoints/model_sparse.ckpt \
+--config configs/inference_pvd_1024.yaml \
+--ddim_steps 50 \
+--video_length 25 \
+--device 'cuda:0' \
+--height 576 \
+--width 1024 \
+--model_path ./checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth
