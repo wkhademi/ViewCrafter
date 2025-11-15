@@ -39,7 +39,7 @@ class ViewCrafter:
     def __init__(self, opts, gradio = False):
         self.opts = opts
         self.device = opts.device
-        self.setup_dust3r()
+        # self.setup_dust3r()
         self.setup_diffusion()
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0) #.cuda()
         self.lpips = LearnedPerceptualImagePatchSimilarity(net_type='vgg', normalize=True) #.cuda()
@@ -51,7 +51,7 @@ class ViewCrafter:
                 assert os.path.isdir(self.opts.image_dir), f"image_dir {self.opts.image_dir} needs to be the base data directory of dataset"
                 
                 # load input and gt data for scene
-                self.images, self.img_ori, self.camera_poses, self.gt_images, self.gt_img_ori, self.gt_camera_poses, self.K = \
+                self.images, self.img_ori, self.camera_poses, self.gt_images, self.gt_img_ori, self.gt_camera_poses, self.K, self.scene_dict = \
                     self.load_data_from_json(
                         data_dir=self.opts.image_dir, 
                         json_file=self.opts.scene_json, 
@@ -59,7 +59,7 @@ class ViewCrafter:
                     )
 
                 # run dust3r
-                self.run_dust3r(input_images=self.images, poses=self.camera_poses, K=self.K, clean_pc=True)
+                # self.run_dust3r(input_images=self.images, poses=self.camera_poses, K=self.K, clean_pc=True)
             elif os.path.isfile(self.opts.image_dir):
                 self.images, self.img_ori = self.load_initial_images(image_dir=self.opts.image_dir)
                 self.run_dust3r(input_images=self.images)
@@ -387,34 +387,54 @@ class ViewCrafter:
                 img = np.transpose(img, (1,2,0))
             return np.clip(img, 0, 1)
 
-        c2ws = self.scene.get_im_poses().detach()
-        principal_points = self.scene.get_principal_points().detach()
-        focals = self.scene.get_focals().detach()
-        
+        c2ws = torch.stack([torch.tensor(pose) for pose in self.camera_poses]).to(self.device).to(torch.float32)
+        principal_points = torch.tensor([[self.K[0,2], self.K[1,2]]]).to(self.device).to(torch.float32)
+        focals = torch.tensor([[self.K[0,0], self.K[1,1]]]).to(self.device).to(torch.float32)
+
         # set camera poses to novel views
-        gt_c2ws = torch.stack([torch.tensor(pose) for pose in self.gt_camera_poses]).to(self.device)
-        principal_points = principal_points[0:1].expand(len(self.gt_camera_poses) + 1, -1)
-        focals = focals[0:1].expand(len(self.gt_camera_poses) + 1, -1)
+        gt_c2ws = torch.stack([torch.tensor(pose) for pose in self.gt_camera_poses]).to(self.device).to(torch.float32)
+        principal_points = principal_points[0:1].expand(len(self.gt_camera_poses) + 1, -1).to(torch.float32)
+        focals = focals[0:1].expand(len(self.gt_camera_poses) + 1, -1).to(torch.float32)
 
         shape = self.images[0]['true_shape']
         H, W = int(shape[0][0]), int(shape[0][1])
-        pcd = [i.detach() for i in self.scene.get_pts3d(clip_thred=self.opts.dpt_trd)] # a list of points of size whc
-        depth = [i.detach() for i in self.scene.get_depthmaps()]
+        # pcd = [i.detach() for i in self.scene.get_pts3d(clip_thred=self.opts.dpt_trd)] # a list of points of size whc
+        # depth = [i.detach() for i in self.scene.get_depthmaps()]
+
+        # print(pcd[0].shape, pcd[0].device, pcd[0].dtype)
+        # print(depth[0].shape, depth[0].device, depth[0].dtype)
+
+        pcd = self.scene_dict['pcd']
+        depth = self.scene_dict['depth']
+
+        # print(pcd[0].shape, pcd[0].device, pcd[0].dtype)
+        # print(depth[0].shape, depth[0].device, depth[0].dtype)
 
         if len(self.images) == 2:
             masks = None
             mask_pc = False
         else:
             ## masks for cleaner point cloud
-            self.scene.min_conf_thr = float(self.scene.conf_trf(torch.tensor(self.opts.min_conf_thr)))
-            masks = self.scene.get_masks()
-            depth = self.scene.get_depthmaps()
+            # self.scene.min_conf_thr = float(self.scene.conf_trf(torch.tensor(self.opts.min_conf_thr)))
+            # masks = self.scene.get_masks()
+            # depth = self.scene.get_depthmaps()
+            # print(masks[0].shape, masks[0].device, masks[0].dtype)
+            # print(depth[0].shape, depth[0].device, depth[0].dtype)
+            masks = self.scene_dict['masks']
+            depth = self.scene_dict['depth']
+            # print(masks[0].shape, masks[0].device, masks[0].dtype)
+            # print(depth[0].shape, depth[0].device, depth[0].dtype)
             bgs_mask = [dpt > self.opts.bg_trd*(torch.max(dpt[40:-40,:])+torch.min(dpt[40:-40,:])) for dpt in depth]
             masks_new = [m+mb for m, mb in zip(masks,bgs_mask)] 
             masks = to_numpy(masks_new)
             mask_pc = True
 
-        imgs = np.array(self.scene.imgs)
+        # imgs = np.array(self.scene.imgs)
+        # print(imgs.min(), imgs.max())
+        # print(imgs.shape, imgs.dtype)
+        imgs = np.array(self.scene_dict['images'])
+        # print(imgs.min(), imgs.max())
+        # print(imgs.shape, imgs.dtype)
 
         camera_traj, num_views, interp_c2ws = generate_traj_interp2(c2ws, gt_c2ws, H, W, focals, principal_points, self.opts.video_length, self.device)
         render_results, viewmask = self.run_render(pcd, imgs, masks, H, W, camera_traj, num_views)
@@ -425,8 +445,8 @@ class ViewCrafter:
         save_video(render_results, os.path.join(self.opts.save_dir, f'render.mp4'))
         save_pointcloud_with_normals(imgs, pcd, msk=masks, save_path=os.path.join(self.opts.save_dir, f'pcd.ply') , mask_pc=mask_pc, reduce_pc=False)
 
-        del self.dust3r
-        del self.scene
+        # del self.dust3r
+        # del self.scene
         torch.cuda.empty_cache()
 
         diffusion_results = []
@@ -636,28 +656,37 @@ class ViewCrafter:
             cam_T[:3, 1] *= -1
             cam_T[:3, 2] *= -1
 
-            # # Rotate the pose -90 degrees about the x-axis (in radians)
-            # angle = -np.pi / 2
-            # Rx = np.array([
-            #     [1, 0, 0, 0],
-            #     [0, np.cos(angle), -np.sin(angle), 0],
-            #     [0, np.sin(angle),  np.cos(angle), 0],
-            #     [0, 0, 0, 1]
-            # ])
-            # cam_T = Rx @ cam_T
-            # # Invert the z-axis by multiplying the third row of the rotation and translation by -1
-            # cam_T[2, :] *= -1
-
             return cam_T
+
+        def __backproject(depth, extrinsics, K):
+            u, v = np.meshgrid(range(depth.shape[1]), range(depth.shape[0]))
+            u = u.reshape([1, -1])[0]
+            v = v.reshape([1, -1])[0]
+
+            z = depth[v, u]
+
+            # calculate coordinates
+            x = (u - K[0][2]) * z / K[0][0]
+            y = (v - K[1][2]) * z / K[1][1]
+
+            point_cam = np.vstack([x, y, z]).T
+
+            # camera to world coordinates
+            R = extrinsics[:3, :3]
+            T = extrinsics[:3, 3]
+            point_canonical = point_cam.dot(R.T) + T
+
+            point_canonical = point_canonical.reshape(depth.shape[0], depth.shape[1], 3)
+            point_canonical = torch.tensor(point_canonical, dtype=torch.float32, device=self.device)
+
+            return point_canonical
         
         if "scannet" in data_dir:
             # parse json file for image file names
             with open(json_file, 'r') as file:
                 data = json.load(file)
             input_image_files = [os.path.join(data_dir, scene_id, "dslr", "render_rgb", i) for i in data[scene_id]['input_view_ids']]
-            # input_image_files = sorted(input_image_files, key=lambda x: x.split('/')[-1].split('.')[0])
             gt_novel_view_image_files = [os.path.join(data_dir, scene_id, "dslr", "render_rgb", i) for i in data[scene_id]['render_view_ids']]
-            # gt_novel_view_image_files = sorted(gt_novel_view_image_files, key=lambda x: x.split('/')[-1].split('.')[0])
 
             # load input images
             input_images = load_images(input_image_files, size=512, force_1024=False)
@@ -678,13 +707,6 @@ class ViewCrafter:
             K = camera_to_intrinsic(pinhole_camera)
 
             # update intrinsics based on resizing and cropping
-            # ratio1 = 1752.0 / 1024.0
-            # scale1 = 1.0 / ratio1
-            # K[:2, :] *= scale1
-            # K[1, 2] = np.round(K[1, 2])
-            # crop = 53.0
-            # K[1, 2] -= crop
-            # ratio2 = 1024.0 / 512.0
             height, width = pinhole_camera.height, pinhole_camera.width
             s_x = 480.0 / float(width)
             s_y = 360.0 / float(height)
@@ -711,8 +733,25 @@ class ViewCrafter:
                 cam_T = np.loadtxt(pose_file)
                 gt_novel_view_camera_poses.append(cam_T)
 
+            scene = {}
+            images = []
+            depth = []
+            masks = []
+            pcd = []
+            for i in range(len(input_image_files)):
+                images.append((input_images[i]['img'].squeeze(0).permute(1,2,0)+1.)/2.)
+                depth.append(torch.tensor(input_images[i]['depth'][0], dtype=torch.float32, device=self.device))
+                mask = torch.ones_like(depth[-1], dtype=torch.bool, device=self.device)
+                mask[depth[-1] == 0.0] = False
+                masks.append(mask)
+                pcd.append(__backproject(input_images[i]['depth'][0], input_camera_poses[i], K))
+            scene['images'] = torch.stack(images, dim=0).numpy()
+            scene['depth'] = depth
+            scene['masks'] = masks
+            scene['pcd'] = pcd
+
             return input_images, input_images_ori, input_camera_poses, gt_novel_view_images, \
-                gt_novel_view_images_ori, gt_novel_view_camera_poses, K
+                gt_novel_view_images_ori, gt_novel_view_camera_poses, K, scene
         elif "3D-FRONT" in data_dir:
             # parse json file for image file names
             with open(json_file, 'r') as file:
@@ -737,13 +776,6 @@ class ViewCrafter:
             K = np.load(os.path.join(data_dir, "cam_K.npy"))
 
             # update intrinsics based on resizing and cropping
-            # ratio1 = 480.0 / 1024.0
-            # scale1 = 1.0 / ratio1
-            # K[:2, :] *= scale1
-            # K[1, 2] = np.round(K[1, 2])
-            # crop = 96.0
-            # K[1, 2] -= crop
-            # ratio2 = 1024.0 / 512.0
             ratio2 = 480.0 / 512.0
             scale2 = 1.0 / ratio2
             K[:2, :] *= scale2
@@ -761,8 +793,25 @@ class ViewCrafter:
                     cam_T = __blender2opencv_cam(np.array(f["cam_Ts"]))
                 gt_novel_view_camera_poses.append(cam_T)
 
+            scene = {}
+            images = []
+            depth = []
+            masks = []
+            pcd = []
+            for i in range(len(input_image_files)):
+                images.append((input_images[i]['img'].squeeze(0).permute(1,2,0)+1.)/2.)
+                depth.append(torch.tensor(input_images[i]['depth'][0], dtype=torch.float32, device=self.device))
+                mask = torch.ones_like(depth[-1], dtype=torch.bool, device=self.device)
+                mask[depth[-1] == 0.0] = False
+                masks.append(mask)
+                pcd.append(__backproject(input_images[i]['depth'][0], input_camera_poses[i], K))
+            scene['images'] = torch.stack(images, dim=0).numpy()
+            scene['depth'] = depth
+            scene['masks'] = masks
+            scene['pcd'] = pcd
+
             return input_images, input_images_ori, input_camera_poses, gt_novel_view_images, \
-                gt_novel_view_images_ori, gt_novel_view_camera_poses, K
+                gt_novel_view_images_ori, gt_novel_view_camera_poses, K, scene
         else:
             raise ValueError(f"Invalid dataset: {data_dir}")
 

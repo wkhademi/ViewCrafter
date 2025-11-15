@@ -5,10 +5,12 @@
 # utilitary functions about images (loading/converting...)
 # --------------------------------------------------------
 import os
+import cv2
 import h5py
 import torch
 import numpy as np
 import PIL.Image
+import matplotlib.pyplot as plt
 from PIL.ImageOps import exif_transpose
 import torchvision.transforms as tvf
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
@@ -86,6 +88,12 @@ def _resize_pil_image(img, long_edge_size):
     return img.resize(new_size, interp)
 
 
+def _resize_cv2_image(img, long_edge_size):
+    S = max(img.shape[:2])
+    new_size = tuple(int(round(x*long_edge_size/S)) for x in reversed(img.shape[:2]))
+    return cv2.resize(img, new_size, interpolation=cv2.INTER_NEAREST)
+
+
 def load_images(folder_or_list, size, square_ok=False,force_1024 = False):
     """ open and convert all images in a list or folder to proper input format for DUSt3R
     """
@@ -113,13 +121,19 @@ def load_images(folder_or_list, size, square_ok=False,force_1024 = False):
             with h5py.File(os.path.join(root, path)) as f:
                 img = np.array(f["colors"])[:,::-1].astype(np.uint8)
                 img = Image.fromarray(img)
+                depth = np.array(f["depth"])[:, ::-1].astype(np.float32)
+                depth[depth >= 10000000000.0] = 0.0
         else:
             img = exif_transpose(PIL.Image.open(os.path.join(root, path))).convert('RGB')
+            depth_path = path.replace('render_rgb', 'render_depth')
+            depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED).astype(np.float32) / 1000.0
         if force_1024:
             img = center_crop_pil_image(img)
         W1, H1 = img.size
         if W1 != 480 or H1 != 360:
             img = img.resize((480, 360), PIL.Image.BICUBIC)
+            depth = cv2.resize(depth, (480, 360), interpolation=cv2.INTER_NEAREST)
+
         img_ori = img
         W1, H1 = img.size
         if size == 224:
@@ -128,6 +142,7 @@ def load_images(folder_or_list, size, square_ok=False,force_1024 = False):
         else:
             # resize long side to 512
             img = _resize_pil_image(img, size)
+            depth = _resize_cv2_image(depth, size)
         W, H = img.size
         cx, cy = W//2, H//2
         if size == 224:
@@ -139,9 +154,11 @@ def load_images(folder_or_list, size, square_ok=False,force_1024 = False):
                 halfh = 3*halfw/4
             img = img.crop((cx-halfw, cy-halfh, cx+halfw, cy+halfh))
         W2, H2 = img.size
+
         print(f' - adding {path} with resolution {W1}x{H1} --> {W2}x{H2}')
         imgs.append(dict(img=ImgNorm(img)[None], true_shape=np.int32(
-            [img.size[::-1]]), idx=len(imgs), instance=str(len(imgs)), img_ori=ImgNorm(img_ori)[None], ))
+            [img.size[::-1]]), idx=len(imgs), instance=str(len(imgs)), img_ori=ImgNorm(img_ori)[None], 
+            depth=depth[None]))
 
     assert imgs, 'no images foud at '+root
     print(f' (Found {len(imgs)} images)')
