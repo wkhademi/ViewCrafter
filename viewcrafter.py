@@ -9,6 +9,7 @@ import trimesh
 import torch
 import json
 import h5py
+import time
 import numpy as np
 import matplotlib.pyplot as plt
 import torchvision
@@ -18,7 +19,6 @@ import cv2
 import glob
 from PIL import Image
 import pytorch3d
-from pytorch3d.structures import Pointclouds
 from torchvision.utils import save_image
 import torch.nn.functional as F
 import torchvision.transforms as transforms
@@ -91,70 +91,6 @@ class ViewCrafter:
         else:
             self.scene = scene
 
-    def render_pcd(self,pts3d,imgs,masks,views,renderer,device,nbv=False):
-        
-        imgs = to_numpy(imgs)
-        pts3d = to_numpy(pts3d)
-
-        if masks == None:
-            pts = torch.from_numpy(np.concatenate([p for p in pts3d])).view(-1, 3).to(device)
-            col = torch.from_numpy(np.concatenate([p for p in imgs])).view(-1, 3).to(device)
-        else:
-            # masks = to_numpy(masks)
-            pts = torch.from_numpy(np.concatenate([p[m] for p, m in zip(pts3d, masks)])).to(device)
-            col = torch.from_numpy(np.concatenate([p[m] for p, m in zip(imgs, masks)])).to(device)
-        
-        point_cloud = Pointclouds(points=[pts], features=[col]).extend(views)
-        images = renderer(point_cloud)
-
-        if nbv:
-            color_mask = torch.ones(col.shape).to(device)
-            point_cloud_mask = Pointclouds(points=[pts],features=[color_mask]).extend(views)
-            view_masks = renderer(point_cloud_mask)
-        else: 
-            view_masks = None
-
-        return images, view_masks
-    
-    def run_render(self, pcd, imgs,masks, H, W, camera_traj,num_views,nbv=False):
-        batch_size = 50  # You may want to make this configurable
-        render_results_list = []
-        viewmask_list = []
-        from pytorch3d.renderer.cameras import PerspectiveCameras
-
-        total_views = num_views if isinstance(num_views, int) else camera_traj.R.shape[0]
-        for i in range(0, total_views, batch_size):
-            batch_slice = slice(i, min(i + batch_size, total_views))
-
-            # Create a sub-batch of camera_traj
-            # Camera parameters: R, T, focal_length, principal_point, etc., must be batched accordingly.
-            cam_kwargs = dict(
-                R=camera_traj.R[batch_slice].to(self.device),
-                T=camera_traj.T[batch_slice].to(self.device),
-                focal_length=camera_traj.focal_length[batch_slice].to(self.device),
-                principal_point=camera_traj.principal_point[batch_slice].to(self.device),
-                image_size=(camera_traj.image_size[0],) * (batch_slice.stop - batch_slice.start) if isinstance(camera_traj.image_size, tuple) else camera_traj.image_size[batch_slice],  # Ensure tuple batch
-                device=self.device,
-                in_ndc=False,
-            )
-            camera_traj_batch = PerspectiveCameras(**cam_kwargs)
-            render_setup = setup_renderer(camera_traj_batch, image_size=(H, W))
-            renderer = render_setup['renderer']
-            batch_results, batch_viewmask = self.render_pcd(
-                pcd, imgs, masks, batch_slice.stop - batch_slice.start, renderer, self.device, nbv=nbv
-            )
-            render_results_list.append(batch_results)
-            viewmask_list.append(batch_viewmask)
-
-        # Concatenate results along batch dimension if not None
-        render_results = torch.cat(render_results_list, dim=0) if render_results_list[0] is not None else None
-        if viewmask_list[0] is not None and all(vm is not None for vm in viewmask_list):
-            viewmask = torch.cat(viewmask_list, dim=0)
-        else:
-            viewmask = None
-        return render_results, viewmask
-
-    
     def run_diffusion(self, renderings, conditioning_frame=None):
 
         prompts = [self.opts.prompt]
@@ -197,7 +133,7 @@ class ViewCrafter:
             ## FIXME hard coded candidate view数量, 以left为例,第一次迭代从[左,左上]中选取, 从第二次开始可以从[左,左上,左下]中选取
             num_candidates = 2
             candidate_poses,thetas,phis = generate_candidate_poses(c2ws, H, W, focals, principal_points, self.opts.d_theta[0], self.opts.d_phi[0],num_candidates, self.device)
-            _, viewmask = self.run_render([pcd[-1]], [imgs[-1]],masks, H, W, candidate_poses,num_candidates)
+            _, viewmask = run_render([pcd[-1]], [imgs[-1]],masks, H, W, candidate_poses,num_candidates, self.device)
             nbv_id = torch.argmin(viewmask.sum(dim=[1,2,3])).item()
             save_image( viewmask.permute(0,3,1,2), os.path.join(self.opts.save_dir,f"candidate_mask0_nbv{nbv_id}.png"), normalize=True, value_range=(0, 1))
             theta_nbv = thetas[nbv_id]
@@ -221,7 +157,7 @@ class ViewCrafter:
         else:
             raise KeyError(f"Invalid Mode: {self.opts.mode}")
 
-        render_results, viewmask = self.run_render([pcd[-1]], [imgs[-1]],masks, H, W, camera_traj,num_views)
+        render_results, viewmask = run_render([pcd[-1]], [imgs[-1]],masks, H, W, camera_traj,num_views, self.device)
         render_results = F.interpolate(render_results.permute(0,3,1,2), size=(576, 1024), mode='bilinear', align_corners=False).permute(0,2,3,1)
         render_results[0] = self.img_ori
         if self.opts.mode == 'single_view_txt':
@@ -261,14 +197,14 @@ class ViewCrafter:
         if self.opts.mode == 'single_view_ref_iterative':
             c2ws,pcd =  world_point_to_obj(poses=c2ws, points=torch.stack(pcd), k=0, r=radius, elevation=self.opts.elevation, device=self.device)
             camera_traj,num_views = generate_traj_specified(c2ws[0:1], H, W, focals[0:1], principal_points[0:1], self.opts.d_theta[iter], self.opts.d_phi[iter], self.opts.d_r[iter],self.opts.video_length, self.device)
-            render_results, viewmask = self.run_render(pcd, imgs,masks, H, W, camera_traj,num_views)
+            render_results, viewmask = run_render(pcd, imgs,masks, H, W, camera_traj,num_views, self.device)
             render_results = F.interpolate(render_results.permute(0,3,1,2), size=(576, 1024), mode='bilinear', align_corners=False).permute(0,2,3,1)
             render_results[0] = self.img_ori
         elif self.opts.mode == 'single_view_1drc_iterative':
             self.opts.elevation -= self.opts.d_theta[iter-1]
             c2ws,pcd =  world_point_to_obj(poses=c2ws, points=torch.stack(pcd), k=-1, r=radius, elevation=self.opts.elevation, device=self.device)
             camera_traj,num_views = generate_traj_specified(c2ws[-1:], H, W, focals[-1:], principal_points[-1:], self.opts.d_theta[iter], self.opts.d_phi[iter], self.opts.d_r[iter],self.opts.video_length, self.device)
-            render_results, viewmask = self.run_render(pcd, imgs,masks, H, W, camera_traj,num_views)
+            render_results, viewmask = run_render(pcd, imgs,masks, H, W, camera_traj,num_views, self.device)
             render_results = F.interpolate(render_results.permute(0,3,1,2), size=(576, 1024), mode='bilinear', align_corners=False).permute(0,2,3,1)
             render_results[0] = (self.images[-1]['img_ori'].squeeze(0).permute(1,2,0)+1.)/2.
         elif self.opts.mode == 'single_view_nbv':
@@ -278,7 +214,7 @@ class ViewCrafter:
             ## FIXME hard coded candidate view数量, 以left为例,第一次迭代从[左,左上]中选取, 从第二次开始可以从[左,左上,左下]中选取
             num_candidates = 3
             candidate_poses,thetas,phis = generate_candidate_poses(c2ws[-1:], H, W, focals[-1:], principal_points[-1:], self.opts.d_theta[0], self.opts.d_phi[0], num_candidates, self.device)
-            _, viewmask = self.run_render(pcd, imgs,masks, H, W, candidate_poses,num_candidates,nbv=True)
+            _, viewmask = run_render(pcd, imgs,masks, H, W, candidate_poses,num_candidates, self.device, nbv=True)
             nbv_id = torch.argmin(viewmask.sum(dim=[1,2,3])).item()
             save_image(viewmask.permute(0,3,1,2), os.path.join(self.opts.save_dir,f"candidate_mask{iter}_nbv{nbv_id}.png"), normalize=True, value_range=(0, 1))
             theta_nbv = thetas[nbv_id]
@@ -287,7 +223,7 @@ class ViewCrafter:
             camera_traj,num_views = generate_traj_specified(c2ws[-1:], H, W, focals[-1:], principal_points[-1:], theta_nbv, phi_nbv, self.opts.d_r[0],self.opts.video_length, self.device)
             # 重置elevation
             self.opts.elevation -= theta_nbv    
-            render_results, viewmask = self.run_render(pcd, imgs,masks, H, W, camera_traj,num_views)
+            render_results, viewmask = run_render(pcd, imgs,masks, H, W, camera_traj,num_views, self.device)
             render_results = F.interpolate(render_results.permute(0,3,1,2), size=(576, 1024), mode='bilinear', align_corners=False).permute(0,2,3,1)
             render_results[0] = (self.images[-1]['img_ori'].squeeze(0).permute(1,2,0)+1.)/2. 
         else:
@@ -326,7 +262,7 @@ class ViewCrafter:
         imgs = np.array(self.scene.imgs)
 
         camera_traj, num_views = generate_traj_interp(c2ws, H, W, focals, principal_points, self.opts.video_length, self.device)
-        render_results, viewmask = self.run_render(pcd, imgs,masks, H, W, camera_traj,num_views)
+        render_results, viewmask = run_render(pcd, imgs,masks, H, W, camera_traj,num_views, self.device)
         render_results = F.interpolate(render_results.permute(0,3,1,2), size=(576, 1024), mode='bilinear', align_corners=False).permute(0,2,3,1)
         
         for i in range(len(self.img_ori)):
@@ -365,7 +301,7 @@ class ViewCrafter:
         img_ref = np.array(self.scene.imgs)[0]
         masks = None
 
-        render_results, viewmask = self.run_render([pcd_ref], [img_ref],masks, H, W, camera_traj,num_views)
+        render_results, viewmask = run_render([pcd_ref], [img_ref],masks, H, W, camera_traj,num_views, self.device)
         render_results = F.interpolate(render_results.permute(0,3,1,2), size=(576, 1024), mode='bilinear', align_corners=False).permute(0,2,3,1)
         render_results[0] = self.img_ori[0]
         save_video(render_results, os.path.join(self.opts.save_dir, f'render_ref0.mp4'))
@@ -376,6 +312,7 @@ class ViewCrafter:
         return diffusion_results
 
     def nvs_sparse_view_eval(self):
+        start_time = time.time()
 
         # Ensure rendered_image and gt_image are on cpu and in numpy format, in [0,1] for display
         def to_numpy_img(img_tensor):
@@ -437,7 +374,7 @@ class ViewCrafter:
         # print(imgs.shape, imgs.dtype)
 
         camera_traj, num_views, interp_c2ws = generate_traj_interp2(c2ws, gt_c2ws, H, W, focals, principal_points, self.opts.video_length, self.device)
-        render_results, viewmask = self.run_render(pcd, imgs, masks, H, W, camera_traj, num_views)
+        render_results, viewmask = run_render(pcd, imgs, masks, H, W, camera_traj, num_views, self.device)
         for i in range(len(self.images)):
             render_results[i*(self.opts.video_length - 1)] = (self.images[i]['img'].squeeze(0).permute(1,2,0)+1.)/2.
         render_results = F.interpolate(render_results.permute(0,3,1,2), size=(576, 1024), mode='bilinear', align_corners=False).permute(0,2,3,1)
@@ -459,6 +396,8 @@ class ViewCrafter:
                 )
             )
         print(f'Finish!\n')
+        end_time = time.time()
+        print(f'Time taken: {end_time - start_time:.4f} s')
         diffusion_results = torch.cat(diffusion_results)
         save_video((diffusion_results + 1.0) / 2.0, os.path.join(self.opts.save_dir, f'diffusion.mp4'))
         # torch.Size([25, 576, 1024, 3])
@@ -517,7 +456,8 @@ class ViewCrafter:
         eval_metrics['psnr'] = psnr
         eval_metrics['ssim'] = ssim_value
         eval_metrics['lpips'] = lpips_value
-
+        eval_metrics['time'] = end_time - start_time
+        
         return diffusion_results, eval_metrics
 
     def nvs_single_view_ref_iterative(self):

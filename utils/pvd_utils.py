@@ -398,6 +398,68 @@ def setup_renderer(cameras, image_size):
 
     return render_setup
 
+def render_pcd(pts3d, imgs, masks, views, renderer, device, nbv=False):
+    from pytorch3d.structures import Pointclouds
+
+    imgs = to_numpy(imgs)
+    pts3d = to_numpy(pts3d)
+
+    if masks == None:
+        pts = torch.from_numpy(np.concatenate([p for p in pts3d])).view(-1, 3).to(device)
+        col = torch.from_numpy(np.concatenate([p for p in imgs])).view(-1, 3).to(device)
+    else:
+        pts = torch.from_numpy(np.concatenate([p[m] for p, m in zip(pts3d, masks)])).to(device)
+        col = torch.from_numpy(np.concatenate([p[m] for p, m in zip(imgs, masks)])).to(device)
+
+    point_cloud = Pointclouds(points=[pts], features=[col]).extend(views)
+    images = renderer(point_cloud)
+
+    if nbv:
+        color_mask = torch.ones(col.shape).to(device)
+        point_cloud_mask = Pointclouds(points=[pts], features=[color_mask]).extend(views)
+        view_masks = renderer(point_cloud_mask)
+    else:
+        view_masks = None
+
+    return images, view_masks
+
+def run_render(pcd, imgs, masks, H, W, camera_traj, num_views, device, nbv=False):
+    batch_size = 50  # You may want to make this configurable
+    render_results_list = []
+    viewmask_list = []
+
+    total_views = num_views if isinstance(num_views, int) else camera_traj.R.shape[0]
+    for i in range(0, total_views, batch_size):
+        batch_slice = slice(i, min(i + batch_size, total_views))
+
+        # Create a sub-batch of camera_traj
+        # Camera parameters: R, T, focal_length, principal_point, etc., must be batched accordingly.
+        cam_kwargs = dict(
+            R=camera_traj.R[batch_slice].to(device),
+            T=camera_traj.T[batch_slice].to(device),
+            focal_length=camera_traj.focal_length[batch_slice].to(device),
+            principal_point=camera_traj.principal_point[batch_slice].to(device),
+            image_size=(camera_traj.image_size[0],) * (batch_slice.stop - batch_slice.start) if isinstance(camera_traj.image_size, tuple) else camera_traj.image_size[batch_slice],  # Ensure tuple batch
+            device=device,
+            in_ndc=False,
+        )
+        camera_traj_batch = PerspectiveCameras(**cam_kwargs)
+        render_setup = setup_renderer(camera_traj_batch, image_size=(H, W))
+        renderer = render_setup['renderer']
+        batch_results, batch_viewmask = render_pcd(
+            pcd, imgs, masks, batch_slice.stop - batch_slice.start, renderer, device, nbv=nbv
+        )
+        render_results_list.append(batch_results)
+        viewmask_list.append(batch_viewmask)
+
+    # Concatenate results along batch dimension if not None
+    render_results = torch.cat(render_results_list, dim=0) if render_results_list[0] is not None else None
+    if viewmask_list[0] is not None and all(vm is not None for vm in viewmask_list):
+        viewmask = torch.cat(viewmask_list, dim=0)
+    else:
+        viewmask = None
+    return render_results, viewmask
+
 def interpolate_sequence(sequence, k,device):
 
     N, M = sequence.size()
