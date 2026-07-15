@@ -3,6 +3,17 @@ model:
   base_learning_rate: 1.0e-05
   scale_lr: False
   target: lvdm.models.ddpm3d.VIPLatentDiffusion
+  ## LoRA finetuning of the UNet's attention projections (to_q/to_k/to_v/to_out.0,
+  ## plus to_k_ip/to_v_ip for image cross-attention). Disabled by default so full
+  ## finetuning behavior is unchanged; set enable: True to freeze the base UNet
+  ## weights and train only the low-rank adapters (cond_stage_trainable /
+  ## image_proj_model_trainable below still apply independently).
+  lora_config:
+    enable: True
+    r: 8
+    alpha: 16
+    dropout: 0.0
+    target_modules: [to_q, to_k, to_v, "to_out.0", to_k_ip, to_v_ip]
   params:
     rescale_betas_zero_snr: True
     parameterization: "v"
@@ -119,23 +130,23 @@ data:
     train:
       target: lvdm.data.threedfront.ThreeDFront
       params:
-        meta_path: /media/wkhademi/BackupDrive/Datasets/3D-FRONT-train-pairs/metadata_train.csv
-        data_dir: /media/wkhademi/BackupDrive/Datasets/3D-FRONT-train-pairs
+        meta_path: /media/volume/wesley-completion-data/3D-FRONT-train-pairs/metadata_train.csv
+        data_dir: /media/volume/wesley-completion-data/3D-FRONT-train-pairs
         video_length: 25
         resolution: [576, 1024]
         fps: 10
     validation:
       target: lvdm.data.threedfront.ThreeDFront
       params:
-        meta_path: /media/wkhademi/BackupDrive/Datasets/3D-FRONT-train-pairs/metadata_val.csv
-        data_dir: /media/wkhademi/BackupDrive/Datasets/3D-FRONT-train-pairs
+        meta_path: /media/volume/wesley-completion-data/3D-FRONT-train-pairs/metadata_val.csv
+        data_dir: /media/volume/wesley-completion-data/3D-FRONT-train-pairs
         video_length: 25
         resolution: [576, 1024]
         fps: 10
 
 lightning:
   precision: 16
-  strategy: deepspeed_stage_2
+  strategy: ddp
   trainer:
     devices: 1
     num_nodes: 1
@@ -143,14 +154,14 @@ lightning:
     accumulate_grad_batches: 4
     max_steps: 20000
     log_every_n_steps: 50
-    val_check_interval: 500
+    val_check_interval: 94
     gradient_clip_algorithm: 'norm'
     gradient_clip_val: 0.5
   callbacks:
     model_checkpoint:
       target: pytorch_lightning.callbacks.ModelCheckpoint
       params:
-        every_n_train_steps: 1000
+        every_n_epochs: 1
         filename: "{epoch}-{step}"
         save_weights_only: True
     batch_logger:

@@ -8,7 +8,7 @@ import torch
 sys.path.insert(1, os.path.join(sys.path[0], '..'))
 from utils.diffusion_utils import instantiate_from_config
 from utils_train import get_trainer_callbacks, get_trainer_logger, get_trainer_strategy
-from utils_train import set_logger, init_workspace, load_checkpoints
+from utils_train import set_logger, init_workspace, load_checkpoints, apply_lora
 
 
 def get_parser(**parser_kwargs):
@@ -70,6 +70,10 @@ if __name__ == "__main__":
 
     ## load checkpoints
     model = load_checkpoints(model, config.model)
+
+    ## optionally inject LoRA adapters (must run after the pretrained weights are
+    ## loaded above, since injection renames/adds parameters)
+    model = apply_lora(model, config.model.get("lora_config", OmegaConf.create()))
 
     ## register_schedule again to make ZTSNR work
     if model.rescale_betas_zero_snr:

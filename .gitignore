@@ -2,3 +2,5 @@
 __pycache__
 checkpoints/
 output/
+logs/
+main/logs/

@@ -135,6 +135,36 @@ def get_trainer_strategy(lightning_config):
     strategy_cfg = OmegaConf.merge(default_strategy_dict, strategy_cfg)
     return strategy_cfg
 
+def apply_lora(model, lora_config):
+    """Inject LoRA adapters into the UNet's attention projections (model.model),
+    freezing everything else in it. Must run AFTER pretrained weights are loaded,
+    since injection renames/adds parameters and would break a strict state_dict load.
+    Leaves cond_stage_model/image_proj_model untouched, so their own
+    cond_stage_trainable/image_proj_model_trainable flags still apply independently.
+    """
+    if not check_config_attribute(lora_config, "enable"):
+        return model
+
+    from peft import LoraConfig, inject_adapter_in_model
+
+    target_modules = list(lora_config.get("target_modules", ["to_q", "to_k", "to_v", "to_out.0"]))
+    peft_config = LoraConfig(
+        r=lora_config.get("r", 8),
+        lora_alpha=lora_config.get("alpha", 16),
+        lora_dropout=lora_config.get("dropout", 0.0),
+        target_modules=target_modules,
+        bias="none",
+    )
+    inject_adapter_in_model(peft_config, model.model)
+    for n, p in model.model.named_parameters():
+        p.requires_grad = "lora_" in n
+
+    n_trainable = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
+    n_total = sum(p.numel() for p in model.model.parameters())
+    mainlogger.info(f">>> LoRA enabled on model.model: {n_trainable}/{n_total} parameters trainable "
+                     f"(r={peft_config.r}, alpha={peft_config.lora_alpha}, target_modules={target_modules})")
+    return model
+
 def load_checkpoints(model, model_cfg):
     if check_config_attribute(model_cfg, "pretrained_checkpoint"):
         pretrained_ckpt = model_cfg.pretrained_checkpoint

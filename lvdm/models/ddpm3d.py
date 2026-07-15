@@ -455,7 +455,7 @@ class DDPM(pl.LightningModule):
 
     def configure_optimizers(self):
         lr = self.learning_rate
-        params = list(self.model.parameters())
+        params = [p for p in self.model.parameters() if p.requires_grad]
         if self.learn_logvar:
             params = params + [self.logvar]
         opt = torch.optim.AdamW(params, lr=lr)
@@ -625,7 +625,7 @@ class LatentDiffusion(DDPM):
             reshape_back = True
         else:
             reshape_back = False
-        
+
         ## consume more GPU memory but faster
         if not self.perframe_ae:
             encoder_posterior = self.first_stage_model.encode(x)
@@ -650,8 +650,8 @@ class LatentDiffusion(DDPM):
             reshape_back = True
         else:
             reshape_back = False
-            
-        if not self.perframe_ae:    
+
+        if not self.perframe_ae:
             z = 1. / self.scale_factor * z
             results = self.first_stage_model.decode(z, **kwargs)
         else:
@@ -796,7 +796,16 @@ class LatentDiffusion(DDPM):
         if (batch_idx+1) % self.log_every_t == 0:
             mainlogger.info(f"batch:{batch_idx}|epoch:{self.current_epoch} [globalstep:{self.global_step}]: loss={loss}")
         return loss
-    
+
+    @torch.no_grad()
+    def validation_step(self, batch, batch_idx):
+        _, loss_dict_no_ema = self.shared_step(batch, random_uncond=False)
+        with self.ema_scope():
+            _, loss_dict_ema = self.shared_step(batch, random_uncond=False)
+            loss_dict_ema = {key + '_ema': loss_dict_ema[key] for key in loss_dict_ema}
+        self.log_dict(loss_dict_no_ema, prog_bar=False, logger=True, on_step=False, on_epoch=True)
+        self.log_dict(loss_dict_ema, prog_bar=False, logger=True, on_step=False, on_epoch=True)
+
     def _get_denoise_row_from_list(self, samples, desc=''):
         denoise_row = []
         for zd in tqdm(samples, desc=desc):
@@ -1219,6 +1228,10 @@ class LatentVisualDiffusion(LatentDiffusion):
         else:
             params = list(self.model.parameters())
             mainlogger.info(f"@Training [{len(params)}] Full Paramters.")
+
+        ## only pass trainable params to the optimizer (e.g. respects LoRA freezing
+        ## of the base model.model weights applied via apply_lora)
+        params = [p for p in params if p.requires_grad]
 
         if self.cond_stage_trainable:
             params_cond_stage = [p for p in self.cond_stage_model.parameters() if p.requires_grad == True]
