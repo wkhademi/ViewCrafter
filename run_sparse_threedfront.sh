@@ -1,11 +1,11 @@
 python inference.py \
---image_dir /media/wkhademi/BackupDrive/Datasets/3D-FRONT-renderings \
---scene_json /media/wkhademi/MainDrive/GradSchool/Code/threedfront_test_scenes.json \
+--image_dir /media/wkhademi/BackupDrive/Datasets/threedfront-processed-vggt/3DFront/3D-FRONT-renderings-v2 \
+--scene_json /media/wkhademi/BackupDrive/Datasets/threedfront-processed-vggt/threedfront_test_scenes.json \
 --out_dir ./output \
 --bg_trd 0.2 \
 --seed 123 \
---ckpt_path ./checkpoints/model_sparse.ckpt \
---config configs/inference_pvd_1024.yaml \
+--ckpt_path ./checkpoints/newer_finetuned_model_sparse.ckpt \
+--config configs/inference_pvd_1024_lora.yaml \
 --ddim_steps 50 \
 --video_length 25 \
 --device 'cuda:0' \

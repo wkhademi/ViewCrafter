@@ -166,8 +166,11 @@ def parse_args():
     parser.add_argument("--n_frames", type=int, default=25)
     parser.add_argument("--height", type=int, default=576)
     parser.add_argument("--width", type=int, default=1024)
-    parser.add_argument("--k_extra_min", type=int, default=1)
-    parser.add_argument("--k_extra_max", type=int, default=3)
+    parser.add_argument("--k_extra_min", type=int, default=0,
+                        help="Min random extra views merged into the point cloud beyond the two anchors. "
+                             "Lower = sparser/more holes in video_cond, closer to a true two-view input.")
+    parser.add_argument("--k_extra_max", type=int, default=1,
+                        help="Max random extra views merged into the point cloud beyond the two anchors.")
     parser.add_argument("--n_val_rooms", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda:0")

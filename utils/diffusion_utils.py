@@ -38,6 +38,41 @@ def instantiate_from_config(config):
     return get_obj_from_str(config["target"])(**config.get("params", dict()))
 
 
+def apply_lora(model, lora_config):
+    """Inject LoRA adapters into the UNet's attention projections (model.model),
+    freezing everything else in it. Same target_modules/r/alpha as used for
+    training must be passed in, since the injected parameter names (lora_A/
+    lora_B) have to match exactly for a finetuned LoRA checkpoint's state_dict
+    to load. For training, call this AFTER the pretrained base checkpoint is
+    loaded (injection adds new parameters that a base-only state_dict won't
+    have). For inference with a LoRA-finetuned checkpoint, call this BEFORE
+    loading that checkpoint (the injected lora_A/lora_B slots must already
+    exist for its state_dict to load with strict=True).
+    """
+    if not lora_config.get("enable", False):
+        return model
+
+    from peft import LoraConfig, inject_adapter_in_model
+
+    target_modules = list(lora_config.get("target_modules", ["to_q", "to_k", "to_v", "to_out.0"]))
+    peft_config = LoraConfig(
+        r=lora_config.get("r", 8),
+        lora_alpha=lora_config.get("alpha", 16),
+        lora_dropout=lora_config.get("dropout", 0.0),
+        target_modules=target_modules,
+        bias="none",
+    )
+    inject_adapter_in_model(peft_config, model.model)
+    for n, p in model.model.named_parameters():
+        p.requires_grad = "lora_" in n
+
+    n_trainable = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
+    n_total = sum(p.numel() for p in model.model.parameters())
+    print(f">>> LoRA enabled on model.model: {n_trainable}/{n_total} parameters trainable "
+          f"(r={peft_config.r}, alpha={peft_config.lora_alpha}, target_modules={target_modules})")
+    return model
+
+
 def get_obj_from_str(string, reload=False):
     module, cls = string.rsplit(".", 1)
     if reload:

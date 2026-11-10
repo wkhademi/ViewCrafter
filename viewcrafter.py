@@ -26,7 +26,7 @@ from PIL import Image
 from utils.pvd_utils import *
 from omegaconf import OmegaConf
 from pytorch_lightning import seed_everything
-from utils.diffusion_utils import instantiate_from_config,load_model_checkpoint,image_guided_synthesis
+from utils.diffusion_utils import instantiate_from_config,load_model_checkpoint,image_guided_synthesis,apply_lora
 from utils.colmap_utils import (
     read_cameras_text, undistorted_camera, camera_to_intrinsic
 )
@@ -545,6 +545,11 @@ class ViewCrafter:
         model = model.to(self.device)
         model.cond_stage_model.device = self.device
         model.perframe_ae = self.opts.perframe_ae
+        ## if this config has LoRA enabled, inject the (untrained) adapter slots
+        ## now, BEFORE loading the checkpoint - a LoRA-finetuned checkpoint's
+        ## state_dict has lora_A/lora_B keys that only exist once injected, so
+        ## a strict load requires the adapters to already be present.
+        model = apply_lora(model, model_config.get("lora_config", OmegaConf.create()))
         assert os.path.exists(self.opts.ckpt_path), "Error: checkpoint Not Found!"
         model = load_model_checkpoint(model, self.opts.ckpt_path)
         model.eval()
@@ -732,6 +737,80 @@ class ViewCrafter:
                 with h5py.File(gt_novel_view_image_files[i]) as f:
                     cam_T = __blender2opencv_cam(np.array(f["cam_Ts"]))
                 gt_novel_view_camera_poses.append(cam_T)
+
+            scene = {}
+            images = []
+            depth = []
+            masks = []
+            pcd = []
+            for i in range(len(input_image_files)):
+                images.append((input_images[i]['img'].squeeze(0).permute(1,2,0)+1.)/2.)
+                depth.append(torch.tensor(input_images[i]['depth'][0], dtype=torch.float32, device=self.device))
+                mask = torch.ones_like(depth[-1], dtype=torch.bool, device=self.device)
+                mask[depth[-1] == 0.0] = False
+                masks.append(mask)
+                pcd.append(__backproject(input_images[i]['depth'][0], input_camera_poses[i], K))
+            scene['images'] = torch.stack(images, dim=0).numpy()
+            scene['depth'] = depth
+            scene['masks'] = masks
+            scene['pcd'] = pcd
+
+            return input_images, input_images_ori, input_camera_poses, gt_novel_view_images, \
+                gt_novel_view_images_ori, gt_novel_view_camera_poses, K, scene
+        elif "replica" in data_dir:
+            # parse json file for image file names
+            with open(json_file, 'r') as file:
+                data = json.load(file)
+            input_image_files = [os.path.join(data_dir, scene_id, "renderings", i) for i in data[scene_id]['input_view_ids']]
+            gt_novel_view_image_files = [os.path.join(data_dir, scene_id, "renderings", i) for i in data[scene_id]['render_view_ids']]
+
+            # load input images
+            input_images = load_images(input_image_files, size=512, force_1024=False)
+            input_images_ori = []
+            for i in range(len(input_image_files)):
+                input_images_ori.append((input_images[i]['img_ori'].squeeze(0).permute(1,2,0)+1.)/2.)
+
+            # load gt images
+            gt_novel_view_images = load_images(gt_novel_view_image_files, size=512, force_1024=False)
+            gt_novel_view_images_ori = []
+            for i in range(len(gt_novel_view_image_files)):
+                gt_novel_view_images_ori.append((gt_novel_view_images[i]['img_ori'].squeeze(0).permute(1,2,0)+1.)/2.)
+
+            K = np.load(os.path.join(data_dir, "cam_K.npy"))
+
+            # update intrinsics based on resizing and cropping
+            ratio2 = 480.0 / 512.0
+            scale2 = 1.0 / ratio2
+            K[:2, :] *= scale2
+            K[1, 2] = np.round(K[1, 2])
+
+            # optional per-scene Manhattan-world alignment: unlike 3D-FRONT's authored
+            # rooms, Replica scenes are real-world scans and aren't canonically
+            # axis-aligned, so a "rotation" ([x,y,z,w] quaternion) key can be set in the
+            # scene json to rotate camera poses about the world origin. Applied in the
+            # already blender->opencv converted frame, matching how it's used elsewhere
+            # (e.g. diff-pbic's replica_dataset.py) for this same processed data.
+            manhattan_rotation = None
+            if 'rotation' in data[scene_id]:
+                manhattan_rotation = R.from_quat(data[scene_id]['rotation']).as_matrix().astype(np.float32)
+
+            def __apply_manhattan_rotation(cam_T):
+                if manhattan_rotation is not None:
+                    cam_T[:3, :3] = manhattan_rotation.dot(cam_T[:3, :3])
+                    cam_T[:3, 3] = manhattan_rotation.dot(cam_T[:3, 3])
+                return cam_T
+
+            # load camera poses
+            input_camera_poses = []
+            for i in range(len(input_image_files)):
+                with h5py.File(input_image_files[i]) as f:
+                    cam_T = __blender2opencv_cam(np.array(f["cam_Ts"]))
+                input_camera_poses.append(__apply_manhattan_rotation(cam_T))
+            gt_novel_view_camera_poses = []
+            for i in range(len(gt_novel_view_image_files)):
+                with h5py.File(gt_novel_view_image_files[i]) as f:
+                    cam_T = __blender2opencv_cam(np.array(f["cam_Ts"]))
+                gt_novel_view_camera_poses.append(__apply_manhattan_rotation(cam_T))
 
             scene = {}
             images = []
